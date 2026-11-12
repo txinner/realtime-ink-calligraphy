@@ -1,5 +1,13 @@
 # Unity URP 实时毛笔书写原型
 
+[下载 Windows 64 位运行包](https://github.com/txinner/realtime-ink-calligraphy/releases/download/v0.3.0/RealtimeInk-Windows-v0.3.zip)。解压整个 ZIP 后双击 `RealtimeInk.exe`。
+
+<p align="center">
+  <img src="docs/calligraphy-preview.png" width="360" alt="宣纸上竖排的山水二字，由项目笔刷渲染">
+  <br>
+  <sub>「山水」· 手工编排笔画轨迹，由本项目实时毛笔渲染</sub>
+</p>
+
 技术路线：**向心 Catmull–Rom 样条 → Droplet 水滴脚印 → 低分辨率 GPU 元胞自动机 → K–M 水墨复合**。
 
 v0.3 新增 **逐笔撤销 / 重复（重做）/ 重写 / 透明 PNG 保存**，见 [笔画操作与导出说明](EDITING.md)。保留共用参数、六个可微调风格快照、三个独立笔法开关和 Windows 执行版，见 [分层参数说明](PARAMETERS.md)。六种预设不限制字形、不改变用户轨迹。
