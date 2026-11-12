@@ -1,0 +1,100 @@
+#pragma kernel InjectNewInk
+#pragma kernel IterateCA
+#pragma multi_compile_local _ INK_CA_FLOAT32
+#pragma multi_compile_local _ INK_WET_FLOAT32
+
+#include "InkNoise.hlsl"
+
+Texture2D<float4> _MainRead;
+Texture2D<float2> _StateRead;       // R: 墨浓度；G: 单调累计的纸张吸附/饱和度。
+Texture2D<float> _WetRead;          // 独立湿度，不能把饱和度误当成干燥时钟。
+#if defined(INK_CA_FLOAT32)
+RWTexture2D<float2> _StateWrite;
+#else
+RWTexture2D<min16float2> _StateWrite;
+#endif
+#if defined(INK_WET_FLOAT32)
+RWTexture2D<float> _WetWrite;
+#else
+RWTexture2D<min16float> _WetWrite;
+#endif
+int2 _CanvasSize, _CASize;
+float _SaturationLimit, _SaturationFromDeposit, _SaturationFromInflux, _AbsorptionRate;
+float _DeltaTime, _DryingRate, _FreezeWetness;
+float2 _InkCoefficients, _WaterCoefficients;
+float _Anisotropy, _FiberAngle, _FiberRandomness;
+
+[numthreads(8, 8, 1)]
+void InjectNewInk(uint3 dispatch : SV_DispatchThreadID)
+{
+    int2 p = int2(dispatch.xy);
+    if (any(p >= _CASize)) return;
+    int2 ratio = _CanvasSize / _CASize; // C# 保证为 2~8 整数，避免漏采细线及非方形 UV 拉伸。
+    float2 dose = 0.0;
+    for (int y = 0; y < ratio.y; y++)
+        for (int x = 0; x < ratio.x; x++)
+            dose += _MainRead.Load(int3(p * ratio + int2(x, y), 0)).gb;
+    dose /= (float)(ratio.x * ratio.y); // 浓度按面积平均，不能直接累加导致低分辨率墨量暴增。
+    float2 old = _StateRead.Load(int3(p, 0));
+    _StateWrite[p] = float2(min(64.0, old.r + dose.x),
+        min(_SaturationLimit, old.g + dose.y * _SaturationFromDeposit));
+    // 只有实际新墨覆盖处可以重新润湿；新笔画不会重置整张纸的干燥时间。
+    _WetWrite[p] = saturate(_WetRead.Load(int3(p, 0)) + dose.y);
+}
+
+float Permeability(float2 state, float wetness)
+{
+    float capacity = saturate(1.0 - state.g / max(0.001, _SaturationLimit));
+    if (state.g >= _SaturationLimit * 0.999) capacity = 0.0; // 包含 half 存储舍入的饱和判定。
+    // 空白干纸允许吸墨；已有墨但已干的像素冻结，除非新脚印直接润湿。
+    float frozen = (state.r > 0.00001 && wetness <= _FreezeWetness) ? 0.0 : 1.0;
+    return capacity * capacity * frozen;
+}
+
+float EdgeFiber(int2 p, int2 q, int axis)
+{
+    // 无向边的固定随机场：p->q 与 q->p 必须得到同一系数，否则不守恒。
+    int2 edge = min(p, q);
+    float2 mainPixel = (float2(p + q) * 0.5 + 0.5) * float2(_CanvasSize) / float2(_CASize);
+    float angle = _FiberAngle + InkPerlin(mainPixel * 0.012) * 0.8;
+    float alignment = axis == 0 ? cos(angle) : sin(angle);
+    float directional = lerp(1.0, alignment * alignment, saturate(_Anisotropy));
+    float random = lerp(1.0, 0.55 + 0.45 * InkRandom(edge + int2(axis * 193, axis * 53)), saturate(_FiberRandomness));
+    return directional * random; // 范围 [0,1]，不会破坏 C# 的稳定性约束。
+}
+
+void AccumulateEdge(int2 p, int2 q, int axis, float2 center, float centerWet,
+                    inout float inkDelta, inout float waterDelta, inout float inkInflux)
+{
+    if (any(q < 0) || any(q >= _CASize)) return; // 纸边无通量，不绕回另一边。
+    float2 neighbor = _StateRead.Load(int3(q, 0));
+    float neighborWet = _WetRead.Load(int3(q, 0));
+    float edge = min(Permeability(center, centerWet), Permeability(neighbor, neighborWet)) * EdgeFiber(p, q, axis);
+    float donorWetness = neighbor.r > center.r ? neighborWet : centerWet;
+    float inkFlow = _InkCoefficients[axis] * edge * saturate(donorWetness) * (neighbor.r - center.r);
+    float waterFlow = _WaterCoefficients[axis] * edge * (neighborWet - centerWet);
+    inkDelta += inkFlow;
+    inkInflux += max(0.0, inkFlow);
+    waterDelta += waterFlow;
+}
+
+[numthreads(8, 8, 1)]
+void IterateCA(uint3 dispatch : SV_DispatchThreadID)
+{
+    int2 p = int2(dispatch.xy);
+    if (any(p >= _CASize)) return;
+    float2 center = _StateRead.Load(int3(p, 0));
+    float centerWet = _WetRead.Load(int3(p, 0));
+    float inkDelta = 0.0, waterDelta = 0.0, inkInflux = 0.0;
+    AccumulateEdge(p, p + int2(1, 0), 0, center, centerWet, inkDelta, waterDelta, inkInflux);
+    AccumulateEdge(p, p - int2(1, 0), 0, center, centerWet, inkDelta, waterDelta, inkInflux);
+    AccumulateEdge(p, p + int2(0, 1), 1, center, centerWet, inkDelta, waterDelta, inkInflux);
+    AccumulateEdge(p, p - int2(0, 1), 1, center, centerWet, inkDelta, waterDelta, inkInflux);
+    float concentration = max(0.0, center.r + inkDelta);
+    float saturation = min(_SaturationLimit, center.g + inkInflux * _SaturationFromInflux +
+        centerWet * _AbsorptionRate * _DeltaTime);
+    float nextWetness = max(0.0, centerWet + waterDelta - _DryingRate * _DeltaTime);
+    if (nextWetness <= _FreezeWetness) nextWetness = 0.0;
+    _StateWrite[p] = float2(concentration, saturation);
+    _WetWrite[p] = nextWetness;
+}

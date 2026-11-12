@@ -1,0 +1,16 @@
+/Library/
+/Temp/
+/Logs/
+/obj/
+/UserSettings/
+*.csproj
+*.sln
+/Distribution/
+/Build/
+/*.log
+/Validation/*.cso
+/RealtimeInk.unitypackage
+/RealtimeInk-URP.zip
+/RealtimeInk-URP-*.zip
+/RealtimeInk-Windows-*.zip
+/Validation/

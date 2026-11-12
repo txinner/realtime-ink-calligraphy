@@ -1,0 +1,131 @@
+#pragma kernel DrawDroplets
+#pragma kernel ClearPending
+#pragma multi_compile_local _ INK_MAIN_FLOAT32
+
+#include "InkNoise.hlsl"
+
+struct DropletStamp
+{
+    float4 shape;    // center.xy, radius, longitudinal scale
+    float4 deposit;  // tangent.xy, pigment dose, water dose
+    float4 variation;  // dryness/noise, stroke seed, soluble fraction, transverse scale
+    float4 profile;    // roundness, tip power, chip strength, noise type
+};
+
+StructuredBuffer<DropletStamp> _Stamps;
+StructuredBuffer<uint> _TileOffsets;
+StructuredBuffer<uint> _TileStampIndices;
+StructuredBuffer<uint> _ActiveTiles;
+#if defined(INK_MAIN_FLOAT32)
+RWTexture2D<float4> _Canvas;
+#else
+RWTexture2D<min16float4> _Canvas;
+#endif
+int2 _CanvasSize;
+int _TileColumns, _ActiveTileCount, _GroupsPerRow;
+float _NoiseFrequency;
+
+float DropletCoverage(DropletStamp stamp, float2 pixel)
+{
+    float2 tangent = stamp.deposit.xy;
+    float2 normal = float2(-tangent.y, tangent.x);
+    float2 delta = pixel - stamp.shape.xy;
+    float2 axes = max(float2(0.05, 0.05), stamp.shape.z * float2(stamp.shape.w, stamp.variation.w));
+    float2 local = float2(dot(delta, tangent), dot(delta, normal));
+    // 亚像素游丝也保留一像素滤波范围，不能按 q>1.5 提前丢弃。
+    if (any(abs(local) > axes * 1.25 + 1.0)) return 0.0;
+    float2 q = local / axes;
+
+    // 后半部圆弧，前半部渐尖：轮廓不具有椭圆的前后对称性。
+    // x=-1 为圆尾端，x=+1 为沿切线的尖端。
+    float x = clamp(q.x, -1.0, 1.0);
+    float rear = lerp(saturate(1.0 + x), sqrt(saturate(1.0 - x * x)), stamp.profile.x);
+    float front = lerp(saturate(1.0 - x), pow(saturate(cos(x * 1.57079632679)), stamp.profile.y), stamp.profile.x);
+    float halfWidth = x < 0.0 ? rear : front;
+    float seed = stamp.variation.y * 17.31;
+    float sd = max(abs(local.y) - halfWidth * axes.y, abs(local.x) - axes.x);
+    float minor = min(axes.x, axes.y);
+    if (stamp.profile.w > 0.5)
+    {
+        // 硬质崩口：固定网格上的角形缺口，不使用宣纸的 Perlin 纤维场。
+        float2 cellUV = pixel * _NoiseFrequency * 0.65;
+        int2 cell = int2(floor(cellUV)) + int2((int)seed * 17, (int)seed * 31);
+        float h = InkRandom(cell);
+        float diamond = abs(frac(cellUV.x) - 0.5) + abs(frac(cellUV.y) - 0.5);
+        float chip = step(0.52, h) * saturate((0.78 - diamond) * 2.5);
+        sd += chip * stamp.profile.z * (0.3 + 0.7 * stamp.variation.x) * minor * 0.65;
+        float coverage = 1.0 - smoothstep(-0.4, 0.4, sd);
+        float broken = step(stamp.variation.x * 0.48, InkRandom(cell * 3 + 7));
+        return coverage * lerp(1.0, broken, stamp.variation.x) * saturate(2.0 * minor);
+    }
+    float grain = InkPerlin(pixel * _NoiseFrequency + seed);
+    sd += grain * stamp.variation.x * 0.16 * minor;
+    float coverage = 1.0 - smoothstep(-0.75, 0.75, sd);
+
+    // 沿笔画拉长的 Perlin 镂空，叠加细粒度噪声；同一笔不随帧随机闪烁。
+    float2 fiberUV = float2(dot(pixel, tangent) * _NoiseFrequency * 0.16,
+                           dot(pixel, normal) * _NoiseFrequency * 1.7);
+    float fiberNoise = saturate(0.5 + 0.5 * InkPerlin(fiberUV + seed * 0.37));
+    float threshold = stamp.variation.x * 0.69;
+    float holes = smoothstep(threshold, threshold + 0.14, fiberNoise);
+    coverage *= lerp(1.0, holes, saturate(stamp.variation.x * 1.3));
+    return coverage * lerp(0.94, 1.0, saturate(0.5 + 0.5 * grain)) * saturate(2.0 * minor);
+}
+
+bool FindTile(uint3 group, out uint tile)
+{
+    uint activeIndex = group.x + group.y * (uint)_GroupsPerRow;
+    tile = 0;
+    if (activeIndex >= (uint)_ActiveTileCount) return false;
+    tile = _ActiveTiles[activeIndex];
+    return true;
+}
+
+// 一个 8x8 thread group 负责 16x16 tile；每线程独占四个像素，无 float atomics。
+[numthreads(8, 8, 1)]
+void DrawDroplets(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID)
+{
+    uint tile;
+    if (!FindTile(group, tile)) return;
+    int2 origin = int2(tile % (uint)_TileColumns, tile / (uint)_TileColumns) * 16;
+    uint begin = _TileOffsets[tile];
+    uint end = _TileOffsets[tile + 1];
+    [unroll] for (int y = 0; y < 2; y++)
+    [unroll] for (int x = 0; x < 2; x++)
+    {
+        int2 pixel = origin + int2(local.xy) + int2(x, y) * 8;
+        if (any(pixel >= _CanvasSize)) continue;
+        float4 value = _Canvas[pixel];
+        // G/B 是本批次临时剂量；上批次已清空。
+        value.gb = 0.0;
+        for (uint i = begin; i < end; i++)
+        {
+            DropletStamp stamp = _Stamps[_TileStampIndices[i]];
+            float coverage = DropletCoverage(stamp, float2(pixel) + 0.5);
+            float dose = coverage * stamp.deposit.z;
+            float mobile = dose * stamp.variation.z;
+            value.r += dose - mobile;
+            value.g += mobile;
+            value.b += coverage * stamp.deposit.w;
+            value.a += dose; // 全部历史剂量，便于守恒验证；不是显示透明度。
+        }
+        _Canvas[pixel] = min(value, 64.0); // 超过此光学厚度已完全黑；数值安全上限。
+    }
+}
+
+[numthreads(8, 8, 1)]
+void ClearPending(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID)
+{
+    uint tile;
+    if (!FindTile(group, tile)) return;
+    int2 origin = int2(tile % (uint)_TileColumns, tile / (uint)_TileColumns) * 16;
+    [unroll] for (int y = 0; y < 2; y++)
+    [unroll] for (int x = 0; x < 2; x++)
+    {
+        int2 pixel = origin + int2(local.xy) + int2(x, y) * 8;
+        if (any(pixel >= _CanvasSize)) continue;
+        float4 value = _Canvas[pixel];
+        value.gb = 0.0;
+        _Canvas[pixel] = value;
+    }
+}
